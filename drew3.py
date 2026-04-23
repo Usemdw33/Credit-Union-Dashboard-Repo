@@ -70,9 +70,10 @@ ACCT: dict[str, list[str]] = {
     "interest_income_ytd": ["ACCT_110"],          # Interest on Loans YTD  (FS220A)
     "invest_income_ytd":   ["ACCT_120"],          # Investment Income YTD  (FS220A)
     "funding_costs_ytd":   ["ACCT_350"],          # Total Dividends+Interest Expense YTD (FS220A)
-    "fee_income_ytd":      ["ACCT_131"],          # Fee Income YTD  (FS220A)
-    "gain_on_assets_ytd":      ["ACCT_430"],           # Gain on sale of assets YTD (FS220A)
-    "other_nonop_income_ytd":  ["ACCT_440"],           # Other non-operating income YTD (FS220A)
+    "fee_income_ytd":          ["ACCT_131"],          # Fee Income YTD  (FS220A)
+    "gain_on_assets_ytd":      ["ACCT_430"],          # Gain on sale of assets YTD (FS220A)
+    "other_nonop_income_ytd":  ["ACCT_440"],          # Other non-operating income YTD (FS220A)
+    "total_nonint_income_ytd": ["ACCT_117"],          # Total Non-Interest Income (FS220A) — preferred for efficiency ratio
 
     # ── FS220A.txt (liquidity cash components) ──────────────────────────────
     "invest_cash_730a":     ["ACCT_730A"],        # Cash component A  (FS220A)
@@ -306,7 +307,9 @@ DARK    = "#2c3e50"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 UPSTART_PERSONAL_YIELD   = 0.065   # 6.5 % net after losses & fees, before cost of funds
-UPSTART_AUTO_HELOC_YIELD = 0.055   # 5.5 % net after losses & fees, before cost of funds
+UPSTART_AUTO_YIELD       = 0.055   # 5.5 % net after losses & fees, before cost of funds
+UPSTART_HELOC_YIELD      = 0.055   # 5.5 % net after losses & fees, before cost of funds
+UPSTART_AUTO_HELOC_YIELD = 0.055   # alias kept for HTML builder references
 
 _CONF_HIGH_SCORE   = 5
 _CONF_MEDIUM_SCORE = 2
@@ -346,8 +349,9 @@ def compute_upstart_recommendation(
     data_pts    = 0
     signals: list[str]  = []
     concerns: list[str] = []
-    want_personal   = False
-    want_auto_heloc = False
+    want_personal = False
+    want_auto     = False
+    want_heloc    = False
 
     # ── 1. ROA ────────────────────────────────────────────────────────────────
     roa = cur.get("roa")
@@ -396,9 +400,13 @@ def compute_upstart_recommendation(
             )
             want_personal = True
         elif nim >= 0.040:
-            concerns.append(
-                f"NIM of {nim:.2%} is already healthy — Upstart would still add yield"
-            )
+            # Suppress the "healthy NIM" concern when investment income is a large
+            # contributor — Section 13 will flag the weaker loan-only NIM instead.
+            nim_ex = cur.get("nim_ex_investments")
+            if nim_ex is None or (nim - nim_ex) <= 0.005:
+                concerns.append(
+                    f"NIM of {nim:.2%} is already healthy — Upstart would still add yield"
+                )
 
     # ── 3. Loan-to-Share ratio ────────────────────────────────────────────────
     lts = cur.get("loan_to_share")
@@ -410,8 +418,9 @@ def compute_upstart_recommendation(
                 f"Loan-to-share of {lts:.1%} is well below ~80% — significant "
                 "idle deposits await deployment via Upstart"
             )
-            want_personal   = True
-            want_auto_heloc = True
+            want_personal = True
+            want_auto     = True
+            want_heloc    = True
         elif lts < 0.75:
             score += 2
             signals.append(
@@ -433,12 +442,13 @@ def compute_upstart_recommendation(
         if inv_yield < UPSTART_AUTO_HELOC_YIELD:
             score += 2
             signals.append(
-                f"Investment yield of {inv_yield:.2%} is below Upstart personal "
-                f"({UPSTART_PERSONAL_YIELD:.1%}) and auto/HELOC ({UPSTART_AUTO_HELOC_YIELD:.1%}) "
-                "net yields — redeployment into Upstart loans improves return"
+                f"Investment yield of {inv_yield:.2%} is below all three Upstart product yields "
+                f"(Personal {UPSTART_PERSONAL_YIELD:.1%}, Auto {UPSTART_AUTO_YIELD:.1%}, "
+                f"HELOC {UPSTART_HELOC_YIELD:.1%}) net — redeployment into Upstart loans improves return"
             )
-            want_personal   = True
-            want_auto_heloc = True
+            want_personal = True
+            want_auto     = True
+            want_heloc    = True
         elif inv_yield < UPSTART_PERSONAL_YIELD:
             score += 1
             signals.append(
@@ -523,7 +533,7 @@ def compute_upstart_recommendation(
                 "loss estimates are factored into yield expectations"
             )
 
-    # ── 10. Loan portfolio composition ───────────────────────────────────────
+    # ── 10. Loan portfolio composition & diversification ─────────────────────
     if cur_loans:
         total_l = cur_loans.get("total_loans") or 0.0
         if total_l > 0:
@@ -536,41 +546,164 @@ def compute_upstart_recommendation(
                 cur_loans.get(k) or 0.0
                 for k in ("loan_new_vehicle", "loan_used_vehicle", "loan_leases")
             )
+            re_total = sum(
+                cur_loans.get(k) or 0.0
+                for k in ("loan_re_1st_lien", "loan_re_junior_lien",
+                          "loan_re_other", "loan_commercial_re")
+            )
             unsec_pct = unsecured / total_l
             auto_pct  = auto / total_l
+            re_pct    = re_total / total_l
 
             if unsec_pct < 0.05:
                 score += 1
                 signals.append(
-                    f"Unsecured personal loans are only {unsec_pct:.1%} of the "
-                    "portfolio — Upstart personal would meaningfully diversify yield"
+                    f"Unsecured personal loans are only {unsec_pct:.1%} of the portfolio — "
+                    "Upstart Unsecured Personal would add a high-yield segment and improve diversification"
                 )
                 want_personal = True
-
-            if auto_pct > 0.25:
+            elif unsec_pct > 0.30:
+                score += 1
                 signals.append(
-                    f"Auto loans represent {auto_pct:.1%} of portfolio — "
-                    "Upstart Auto could help maintain or grow this profitable segment"
+                    f"Unsecured loans are {unsec_pct:.1%} of portfolio — Upstart Auto Retail "
+                    "or HELOC would balance concentration and reduce credit risk in this segment"
                 )
-                want_auto_heloc = True
+                want_auto  = True
+                want_heloc = True
+
+            if auto_pct < 0.10:
+                score += 1
+                signals.append(
+                    f"Auto loans are only {auto_pct:.1%} of portfolio — Upstart Auto Retail "
+                    "would grow this underweighted segment and improve yield mix"
+                )
+                want_auto = True
+            elif auto_pct > 0.40:
+                score += 1
+                signals.append(
+                    f"Auto loans are {auto_pct:.1%} of portfolio — Upstart Unsecured Personal "
+                    "or HELOC would reduce auto concentration and diversify interest income"
+                )
+                want_personal = True
+                want_heloc    = True
+
+            if re_pct > 0.50:
+                score += 1
+                signals.append(
+                    f"Real estate loans represent {re_pct:.1%} of portfolio — Upstart "
+                    "Unsecured Personal and Auto Retail would reduce RE concentration and "
+                    "improve overall yield"
+                )
+                want_personal = True
+                want_auto     = True
+
+    # ── 11. HELOC utilization (Upstart 80% draw-at-origination advantage) ────
+    if cur_loans:
+        heloc_funded   = cur_loans.get("loan_re_junior_lien") or 0.0
+        heloc_unfunded = cur_loans.get("unfunded_re_junior_lien") or 0.0
+        heloc_total    = heloc_funded + heloc_unfunded
+        if heloc_total > 0:
+            data_pts += 1
+            heloc_util = heloc_funded / heloc_total
+            if heloc_util < 0.50:
+                score += 3
+                signals.append(
+                    f"HELOC utilization is only {heloc_util:.0%} — the existing revolving pool "
+                    "is largely idle. Upstart HELOC loans require an 80% draw at origination, "
+                    "converting committed capital to earning assets immediately and generating "
+                    "significantly more interest income than low-utilization revolving lines"
+                )
+                want_heloc = True
+            elif heloc_util < 0.75:
+                score += 2
+                signals.append(
+                    f"HELOC utilization of {heloc_util:.0%} is below full deployment. "
+                    "Upstart HELOC's required 80% draw at origination puts capital to work "
+                    "faster than revolving lines, improving yield on the HELOC portfolio"
+                )
+                want_heloc = True
+            else:
+                signals.append(
+                    f"HELOC utilization is {heloc_util:.0%} — lines are well-utilized. "
+                    "Upstart HELOC's 80% origination draw aligns with existing usage patterns "
+                    "and maintains strong earning-asset deployment"
+                )
+
+    # ── 12. Administrative & origination cost savings ─────────────────────────
+    # Upstart loans are purchased by the CU fully underwritten — no loan officers,
+    # credit review staff, or origination systems required on the CU's side.
+    score += 1
+    data_pts += 1
+    signals.append(
+        "Upstart loans are purchased fully underwritten — no in-house credit review, "
+        "loan officer time, or origination system cost required. This reduces effective "
+        "cost per loan and improves net yield versus conventionally originated loans"
+    )
+
+    # ── 13. NIM decomposition — investment-propped margin ────────────────────
+    # A high overall NIM can mask a weak loan margin when investment yield is
+    # unusually elevated. Upstart loans improve the loan-side NIM directly.
+    nim     = cur.get("net_interest_margin")
+    nim_ex  = cur.get("nim_ex_investments")
+    if nim is not None and nim_ex is not None:
+        inv_contrib = nim - nim_ex   # percentage-points of NIM supplied by investments
+        if inv_contrib > 0.005:      # investments contribute > 50 bps to NIM
+            data_pts += 1
+            if nim_ex < 0.025:
+                score += 3
+                signals.append(
+                    f"Overall NIM of {nim:.2%} is heavily supported by investment income "
+                    f"(+{inv_contrib:.2%}); loan-only NIM is only {nim_ex:.2%} — well below "
+                    "the 3.00% benchmark. Upstart personal loans would directly strengthen "
+                    "the lending margin regardless of investment portfolio performance"
+                )
+                want_personal = True
+            elif nim_ex < 0.030:
+                score += 2
+                signals.append(
+                    f"NIM of {nim:.2%} is propped up by {inv_contrib:.2%} of investment "
+                    f"income — loan-only NIM is {nim_ex:.2%}, near the 3.00% benchmark. "
+                    "Upstart personal loans would improve core lending yield independently "
+                    "of the investment portfolio"
+                )
+                want_personal = True
+            elif nim_ex < 0.040 and inv_contrib > 0.008:
+                score += 1
+                signals.append(
+                    f"Investment income contributes {inv_contrib:.2%} to overall NIM of "
+                    f"{nim:.2%} — loan-only NIM is {nim_ex:.2%}. Upstart loans would "
+                    "diversify and grow interest income beyond what the investment portfolio "
+                    "alone provides"
+                )
+                want_personal = True
 
     # ── Determine product recommendations ────────────────────────────────────
     products: list[str]               = []
     product_reasoning: dict[str, str] = {}
 
-    if want_personal or (score >= 2 and not want_auto_heloc):
-        products.append("Personal Loans")
-        product_reasoning["Personal Loans"] = (
-            f"Upstart personal loans target ~{UPSTART_PERSONAL_YIELD:.1%} net return "
-            "after losses and fees (before cost of funds) — highest-yield Upstart product, "
-            "best suited for improving NIM and ROA"
+    if want_personal or (score >= 2 and not want_auto and not want_heloc):
+        products.append("Unsecured Personal")
+        product_reasoning["Unsecured Personal"] = (
+            f"Upstart Unsecured Personal loans target ~{UPSTART_PERSONAL_YIELD:.1%} net return "
+            "after losses and fees (before cost of funds) — the highest-yield Upstart product, "
+            "best suited for improving NIM and ROA. Delivered fully underwritten with no "
+            "in-house origination cost."
         )
-    if want_auto_heloc:
-        products.append("Auto / HELOC")
-        product_reasoning["Auto / HELOC"] = (
-            f"Upstart auto/HELOC targets ~{UPSTART_AUTO_HELOC_YIELD:.1%} net return "
-            "after losses and fees (before cost of funds) — lower risk profile, "
-            "complements existing auto or mortgage lending infrastructure"
+    if want_auto:
+        products.append("Auto Retail")
+        product_reasoning["Auto Retail"] = (
+            f"Upstart Auto Retail targets ~{UPSTART_AUTO_YIELD:.1%} net return "
+            "after losses and fees (before cost of funds) — lower risk profile, complements "
+            "existing auto lending infrastructure. Delivered pre-underwritten without additional "
+            "staffing or systems overhead."
+        )
+    if want_heloc:
+        products.append("HELOC")
+        product_reasoning["HELOC"] = (
+            f"Upstart HELOC targets ~{UPSTART_HELOC_YIELD:.1%} net return after losses and "
+            "fees (before cost of funds). Upstart HELOC loans require an 80% draw at origination, "
+            "immediately converting committed capital to earning assets — more revenue than "
+            "revolving lines that may sit underutilized."
         )
 
     # ── Overall verdict ───────────────────────────────────────────────────────
@@ -612,16 +745,18 @@ def compute_upstart_recommendation(
             parts.append(f"• **{p}**: {product_reasoning[p]}")
 
     cof_note = (
-        f"With this credit union's cost of funds at {cof:.2%}, the net spread above "
-        f"funding costs would be approximately {UPSTART_PERSONAL_YIELD - cof:.2%} for "
-        f"personal loans and {UPSTART_AUTO_HELOC_YIELD - cof:.2%} for auto/HELOC."
+        f"With this credit union's cost of funds at {cof:.2%}, the net spread above funding "
+        f"costs would be approximately {UPSTART_PERSONAL_YIELD - cof:.2%} for Unsecured Personal, "
+        f"{UPSTART_AUTO_YIELD - cof:.2%} for Auto Retail, and {UPSTART_HELOC_YIELD - cof:.2%} "
+        f"for HELOC."
         if cof is not None
         else "Cost of funds data was not available to calculate precise spread above funding costs."
     )
     parts.append(
-        f"\n**Return Context:** Upstart personal loans target ~{UPSTART_PERSONAL_YIELD:.1%} net "
-        f"return after losses and fees; auto/HELOC products target ~{UPSTART_AUTO_HELOC_YIELD:.1%} "
-        f"net. {cof_note}"
+        f"\n**Return Context:** Upstart Unsecured Personal targets ~{UPSTART_PERSONAL_YIELD:.1%} "
+        f"net return after losses and fees; Auto Retail and HELOC target ~{UPSTART_AUTO_YIELD:.1%} "
+        f"net. All yields are before cost of funds and delivered without in-house origination cost. "
+        f"{cof_note}"
     )
 
     conf_note = {
@@ -804,8 +939,10 @@ def build_upstart_rationale_html(rec: dict) -> str:
         f'    <div class="analysis">{_md(rationale)}</div>\n'
         f'  </div>\n'
         f'  <p class="source-note" style="margin-top:14px;">\n'
-        f'    Upstart yields are illustrative targets (~{UPSTART_PERSONAL_YIELD:.1%} personal, '
-        f'~{UPSTART_AUTO_HELOC_YIELD:.1%} auto/HELOC) net of losses and fees, before cost of funds. '
+        f'    Upstart yields are illustrative targets (~{UPSTART_PERSONAL_YIELD:.1%} Unsecured Personal, '
+        f'~{UPSTART_AUTO_YIELD:.1%} Auto Retail, ~{UPSTART_HELOC_YIELD:.1%} HELOC) net of losses '
+        f'and fees, before cost of funds. All products are delivered fully underwritten with no '
+        f'in-house origination cost. HELOC loans require an 80% draw at origination. '
         f'Actual results depend on credit-union-specific factors, Upstart program terms, and '
         f'prevailing market conditions. Not investment or regulatory advice.\n'
         f'  </p>\n'
@@ -2130,8 +2267,15 @@ def calc_ratios(record: dict, prev: Optional[dict] = None) -> dict:
     total_int_inc = (int_inc or 0.0) + (inv_inc or 0.0)
     nii_ytd = (total_int_inc - (funding or 0.0)) if (int_inc is not None or inv_inc is not None) else None
 
-    # Non-Interest Income YTD
-    non_int_inc_ytd = (fee_inc or 0.0) + (oth_inc or 0.0) if fee_inc is not None else None
+    # Non-Interest Income YTD — use NCUA's official total (ACCT_117) when available;
+    # it captures all components including insurance income, mortgage banking, etc.
+    # Fall back to summing known sub-components for CUs or quarters where ACCT_117 is absent.
+    _total_nonint = _get(record, "total_nonint_income_ytd")
+    non_int_inc_ytd = (
+        _total_nonint
+        if _total_nonint is not None
+        else (fee_inc or 0.0) + (oth_inc or 0.0) if fee_inc is not None else None
+    )
 
     r: dict = {
         "quarter":      ql(yr, mo),
@@ -2150,6 +2294,15 @@ def calc_ratios(record: dict, prev: Optional[dict] = None) -> dict:
     # NIM: annualised net interest income / total assets
     r["net_interest_margin"] = _div(
         nii_ytd * af if nii_ytd is not None else None, ta
+    )
+
+    # NIM excluding investment income — isolates loan yield vs. funding cost.
+    # When investment yield is unusually high it can flatter overall NIM; this
+    # field exposes the loan-only contribution so the recommendation module can
+    # flag cases where the lending margin is weaker than NIM implies.
+    r["nim_ex_investments"] = _div(
+        ((int_inc or 0.0) - (funding or 0.0)) * af if int_inc is not None else None,
+        ta,
     )
 
     # Investment Yield: annualised investment income / total investment portfolio
