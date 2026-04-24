@@ -92,8 +92,11 @@ ACCT: dict[str, list[str]] = {
     "invest_other":         ["ACCT_AS0017"],      # Total Other Investments      (FS220P)
 
     # ── Loan rates (basis points stored by NCUA; ÷ 100 → %) ─────────────────
-    "rate_unsecured":        ["ACCT_560"],         # Most common unsecured/CC rate (FS220A)
-    "rate_new_auto":         ["ACCT_561"],         # New vehicle rate (FS220A)
+    # ACCT_560/561 were retired pre-1989; current fields are ACCT_521-524 in FS220 main file
+    "rate_credit_card":      ["ACCT_521"],         # Credit card loan rate (FS220)
+    "rate_other_unsecured":  ["ACCT_522"],         # All other unsecured loan rate (FS220)
+    "rate_new_auto":         ["ACCT_523"],         # New vehicle loan rate (FS220)
+    "rate_used_auto":        ["ACCT_524"],         # Used vehicle loan rate (FS220)
     "rate_leases":           ["ACCT_565"],         # Lease receivable rate (FS220A)
     "rate_pal":              ["ACCT_522A"],        # PAL loan rate (FS220H)
     "rate_student":          ["ACCT_595A"],        # Student loan rate (FS220H)
@@ -1901,12 +1904,12 @@ LOAN_CATEGORIES: list[tuple[str, str]] = [
 
 
 LOAN_RATE_KEY: dict[str, str] = {
-    "loan_credit_card":      "rate_unsecured",
+    "loan_credit_card":      "rate_credit_card",
     "loan_pal":              "rate_pal",
     "loan_student":          "rate_student",
-    "loan_other_unsecured":  "rate_unsecured",
+    "loan_other_unsecured":  "rate_other_unsecured",
     "loan_new_vehicle":      "rate_new_auto",
-    "loan_used_vehicle":     "rate_new_auto",
+    "loan_used_vehicle":     "rate_used_auto",
     "loan_leases":           "rate_leases",
     "loan_other_secured":    "rate_other_secured",
     "loan_re_1st_lien":      "rate_re_1st_lien",
