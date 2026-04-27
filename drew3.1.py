@@ -59,6 +59,7 @@ ACCT: dict[str, list[str]] = {
     "total_assets":        ["ACCT_010"],          # Total Assets
     "total_loans":         ["ACCT_025B"],          # Total Loans & Leases (net)
     "total_shares":        ["ACCT_018"],          # Total Shares & Deposits
+    "members":             ["ACCT_083"],          # Number of current members (FS220)
     "delinquent":          ["ACCT_041B"],          # Delinquent 2+ months
     "opex_ytd":            ["ACCT_671"],          # Total Non-Interest Expense YTD
     "gross_chargeoffs_ytd":["ACCT_550"],          # Gross charge-offs YTD
@@ -3018,6 +3019,8 @@ def build_dashboard(
             meta_chip("🏛", "Charter", cu_meta.get("cu_type", "")),
             meta_chip("👥", "Field of Membership", cu_meta.get("fom", "")),
         ]
+        if cu_meta.get("members") is not None:
+            chips.append(meta_chip("👥", "Members", f"{cu_meta['members']:,}"))
         if cu_meta.get("num_branches") is not None:
             chips.append(meta_chip("🏢", "Branches", str(cu_meta["num_branches"])))
         if cu_meta.get("ceo_name"):
@@ -3436,6 +3439,12 @@ def main() -> None:
         cur_rec   = raw[-1]
         prior_rec = raw[-2]
         old_rec   = raw[0]   # oldest fetched quarter (matches trend table leftmost column)
+
+        # Add member count from latest call report into cu_info for the header
+        if cu_info is not None:
+            m = _get(cur_rec, "members")
+            if m and m > 0:
+                cu_info["members"] = int(m)
 
         old_label   = ql(old_rec["_year"],   old_rec["_month"])
         prior_label = ql(prior_rec["_year"], prior_rec["_month"])
