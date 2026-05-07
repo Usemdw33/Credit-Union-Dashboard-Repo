@@ -18,6 +18,9 @@ Usage:
 """
 
 import io
+import csv
+import html as html_lib
+import json
 import os
 import re
 import sys
@@ -1271,6 +1274,9 @@ def build_upstart_rationale_html(rec: dict) -> str:
             for i, item in enumerate(items)
         )
 
+    empty_signal_li = '<li style="color:#95a5a6;">None identified</li>'
+    signal_rows_html = _rows(signals, "&#10003;", "#27ae60", weights=signal_weights) or empty_signal_li
+
     sig_col = (
         f'<div style="flex:1;min-width:260px;">'
         f'<p style="font-size:.78rem;font-weight:700;text-transform:uppercase;'
@@ -1278,7 +1284,7 @@ def build_upstart_rationale_html(rec: dict) -> str:
         f'Supporting Factors <span style="font-weight:400;font-style:italic;'
         f'text-transform:none;letter-spacing:0;">&mdash; ranked by impact</span></p>'
         f'<ul style="list-style:none;margin:0;padding:0;">'
-        f'{_rows(signals, "&#10003;", "#27ae60", weights=signal_weights) or "<li style=\'color:#95a5a6;\'>None identified</li>"}'
+        f'{signal_rows_html}'
         f'</ul></div>'
     ) if signals else ""
 
@@ -3229,6 +3235,506 @@ def gpt_analysis(cu_name: str, ratios: list[dict]) -> str:
 # Dashboard builder
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _safe_export_base(cu_name: str) -> str:
+    return re.sub(r"[^\w\s-]", "", cu_name).strip().replace(" ", "_") or "credit_union_dashboard"
+
+
+def _md_escape(value: object) -> str:
+    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def _plain_text_from_html(html_text: str) -> str:
+    """Convert generated dashboard HTML snippets into readable text for exports."""
+    if not html_text:
+        return ""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", html_text)
+    text = re.sub(r"(?i)</(p|div|li|h[1-6]|tr)>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _fmt_pct(v: Optional[float], digits: int = 2) -> str:
+    return "N/A" if v is None else f"{v:.{digits}%}"
+
+
+def _fmt_raw(v: Optional[float]) -> str:
+    if v is None or v == "":
+        return ""
+    try:
+        return f"{float(v):.10g}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _json_safe(value):
+    """Recursively coerce export values into JSON-safe primitives."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _markdown_table(headers: list[str], rows: list[list[object]]) -> str:
+    lines = [
+        "| " + " | ".join(_md_escape(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(_md_escape(v) for v in row) + " |")
+    return "\n".join(lines)
+
+
+def _portfolio_md_rows(
+    categories: list[tuple[str, str]],
+    old_vals: dict,
+    prior_vals: dict,
+    cur_vals: dict,
+    old_label: str,
+    prior_label: str,
+    cur_label: str,
+    value_formatter,
+    current_extras: Optional[dict[str, str]] = None,
+) -> list[list[object]]:
+    rows = []
+    for key, label in categories:
+        cur_v = cur_vals.get(key)
+        qoq, _ = _fmt_change(cur_v, prior_vals.get(key))
+        yoy, _ = _fmt_change(cur_v, old_vals.get(key))
+        row = [
+            label,
+            value_formatter(old_vals.get(key)),
+            value_formatter(prior_vals.get(key)),
+            value_formatter(cur_v),
+            qoq,
+            yoy,
+        ]
+        if current_extras:
+            row.append(current_extras.get(key, ""))
+        rows.append(row)
+    return rows
+
+
+def build_export_artifacts(
+    cu_name: str,
+    ratios: list[dict],
+    analysis: str,
+    cu_meta: Optional[dict],
+    export_data: dict,
+    upstart_rec: Optional[dict],
+    sales_questions_html: str = "",
+) -> dict:
+    """
+    Build deterministic, structured exports embedded in the generated dashboard.
+
+    Markdown is optimized for another LLM or agent to ingest the CU's situation.
+    CSV is long-form so coworkers can filter/pivot metrics without scraping HTML.
+    HTML/PDF are handled in-browser so the visual dashboard stays faithful.
+    """
+    file_base = _safe_export_base(cu_name)
+    generated = date.today().isoformat()
+    quarters = [r.get("quarter", "") for r in ratios]
+    latest = ratios[-1] if ratios else {}
+
+    md: list[str] = [
+        f"# {cu_name} NCUA 5300 Dashboard Export",
+        "",
+        f"- Generated: {generated}",
+        f"- Reporting quarters: {quarters[0] if quarters else 'N/A'} to {quarters[-1] if quarters else 'N/A'}",
+        "- Intended use: structured context for analysis by another model, agent, or analyst.",
+        "- Source: NCUA 5300 Call Report bulk data; HMDA section uses FFIEC Data Browser when available.",
+        "",
+        "## Credit Union Profile",
+    ]
+
+    if cu_meta:
+        profile_rows = [
+            ["CU Name", cu_name],
+            ["Charter Number", cu_meta.get("cu_number", "")],
+            ["Location", f"{cu_meta.get('city', '')} {cu_meta.get('state', '')}".strip()],
+            ["Charter Type", cu_meta.get("cu_type", "")],
+            ["Field of Membership", cu_meta.get("fom", "")],
+            ["Members", f"{cu_meta.get('members', ''):,}" if isinstance(cu_meta.get("members"), int) else cu_meta.get("members", "")],
+            ["Branches", cu_meta.get("num_branches", "")],
+            ["CEO", cu_meta.get("ceo_name", "")],
+            ["Year Opened", cu_meta.get("year_opened", "")],
+            ["Low-Income Designated", "Yes" if cu_meta.get("low_income") else "No"],
+        ]
+        md.append(_markdown_table(["Field", "Value"], profile_rows))
+    else:
+        md.append("No CU metadata was available.")
+
+    if upstart_rec:
+        md.extend([
+            "",
+            "## Upstart Partnership Recommendation",
+            "",
+            _markdown_table(
+                ["Field", "Value"],
+                [
+                    ["Overall", upstart_rec.get("overall", "")],
+                    ["Confidence", upstart_rec.get("confidence", "")],
+                    ["Score", upstart_rec.get("score", "")],
+                    ["Data Points", upstart_rec.get("data_points", "")],
+                    ["Recommended Products", ", ".join(upstart_rec.get("products", [])) or "None"],
+                ],
+            ),
+        ])
+        if upstart_rec.get("products"):
+            md.append("\n### Product Rationale")
+            prod_rows = [
+                [
+                    i + 1,
+                    product,
+                    upstart_rec.get("product_scores", {}).get(product, ""),
+                    upstart_rec.get("product_reasoning", {}).get(product, ""),
+                ]
+                for i, product in enumerate(upstart_rec.get("products", []))
+            ]
+            md.append(_markdown_table(["Rank", "Product", "Score", "Rationale"], prod_rows))
+        if upstart_rec.get("signals"):
+            md.append("\n### Supporting Factors")
+            for i, signal in enumerate(upstart_rec.get("signals", []), 1):
+                weight = ""
+                weights = upstart_rec.get("signal_weights", [])
+                if i - 1 < len(weights):
+                    weight = f" (impact {weights[i - 1]})"
+                md.append(f"{i}. {signal}{weight}")
+        if upstart_rec.get("concerns"):
+            md.append("\n### Considerations and Cautions")
+            for concern in upstart_rec.get("concerns", []):
+                md.append(f"- {concern}")
+        if upstart_rec.get("rationale"):
+            md.extend(["", "### Full Rationale", upstart_rec["rationale"]])
+
+    md.extend(["", "## Key Ratio Summary"])
+    ratio_headers = ["Metric", "Description", "Benchmark"] + quarters
+    ratio_rows_md = []
+    for rk, info in RATIOS.items():
+        ratio_rows_md.append(
+            [info["label"], info["desc"], info["bm_label"]]
+            + [fv(rk, r.get(rk)) for r in ratios]
+        )
+    md.append(_markdown_table(ratio_headers, ratio_rows_md))
+
+    if latest:
+        md.extend(["", "## Latest Quarter Raw Snapshot"])
+        latest_rows = [
+            ["Total Assets", _fmt_dollars(latest.get("_total_assets"))],
+            ["Total Shares and Deposits", _fmt_dollars(latest.get("_total_shares"))],
+            ["Total Borrowings", _fmt_dollars(latest.get("_total_borrowings"))],
+            ["Latest Quarter", latest.get("quarter", "")],
+        ]
+        md.append(_markdown_table(["Metric", "Value"], latest_rows))
+
+    labels = export_data.get("labels", {})
+    old_label = labels.get("old", "Oldest")
+    prior_label = labels.get("prior", "Prior")
+    cur_label = labels.get("current", "Current")
+
+    shares = export_data.get("shares")
+    if shares:
+        md.extend(["", "## Shares and Deposits"])
+        rows = _portfolio_md_rows(
+            SHARE_CATEGORIES,
+            shares.get("old", {}),
+            shares.get("prior", {}),
+            shares.get("current", {}),
+            old_label,
+            prior_label,
+            cur_label,
+            _fmt_dollars,
+        )
+        md.append(_markdown_table(["Category", old_label, prior_label, cur_label, "QoQ", "YoY"], rows))
+
+    loans = export_data.get("loans")
+    if loans:
+        current_loans = loans.get("current", {})
+        cur_rates = export_data.get("loan_rates", {})
+        cur_losses = export_data.get("loan_losses", {})
+        extras: dict[str, str] = {}
+        for key, _ in LOAN_CATEGORIES:
+            notes = []
+            rate_key = LOAN_RATE_KEY.get(key)
+            if rate_key and cur_rates.get(rate_key) is not None:
+                notes.append(f"rate {_fmt_pct(cur_rates.get(rate_key), 2)}")
+            if key == "total_loans" and export_data.get("portfolio_yield") is not None:
+                notes.append(f"portfolio yield {_fmt_pct(export_data.get('portfolio_yield'), 2)}")
+            loss = cur_losses.get(key)
+            balance = current_loans.get(key)
+            if loss is not None and balance:
+                notes.append(f"NCO {_fmt_pct(loss / balance, 2)}")
+            if key == "total_loans" and export_data.get("portfolio_nco") is not None:
+                notes.append(f"portfolio NCO {_fmt_pct(export_data.get('portfolio_nco'), 2)}")
+            extras[key] = "; ".join(notes)
+        md.extend(["", "## Loan Portfolio"])
+        rows = _portfolio_md_rows(
+            LOAN_CATEGORIES,
+            loans.get("old", {}),
+            loans.get("prior", {}),
+            current_loans,
+            old_label,
+            prior_label,
+            cur_label,
+            _fmt_dollars,
+            extras,
+        )
+        md.append(_markdown_table(["Category", old_label, prior_label, cur_label, "QoQ", "YoY", "Current Notes"], rows))
+
+    investments = export_data.get("investments")
+    if investments:
+        md.extend(["", "## Investment Portfolio"])
+        if export_data.get("investment_yield") is not None:
+            md.append(f"- Current portfolio yield: {_fmt_pct(export_data.get('investment_yield'), 2)}")
+        type_rows = _portfolio_md_rows(
+            INVEST_TYPE_CATEGORIES,
+            investments.get("old", {}),
+            investments.get("prior", {}),
+            investments.get("current", {}),
+            old_label,
+            prior_label,
+            cur_label,
+            _fmt_dollars,
+        )
+        md.append(_markdown_table(["Investment Type", old_label, prior_label, cur_label, "QoQ", "YoY"], type_rows))
+        maturity_rows = []
+        cur_total = investments.get("current", {}).get("total_invest") or 0.0
+        for key, label in INVEST_MATURITY_BUCKETS:
+            cur_v = investments.get("current", {}).get(key)
+            maturity_rows.append([
+                label,
+                _fmt_dollars(investments.get("old", {}).get(key)),
+                _fmt_dollars(investments.get("prior", {}).get(key)),
+                _fmt_dollars(cur_v),
+                f"{cur_v / cur_total:.1%}" if cur_v is not None and cur_total else "N/A",
+            ])
+        md.append("\n### Investment Maturity Schedule")
+        md.append(_markdown_table(["Bucket", old_label, prior_label, cur_label, "% of Current Portfolio"], maturity_rows))
+
+    asset_classes = export_data.get("asset_classes")
+    if asset_classes:
+        md.extend(["", "## Loan Portfolio by Asset Class"])
+        cur_total = asset_classes.get("current", {}).get("total") or 0.0
+        ac_rows = []
+        for cls_name, _ in ASSET_CLASSES:
+            cur_v = asset_classes.get("current", {}).get(cls_name)
+            qoq, _ = _fmt_change(cur_v, asset_classes.get("prior", {}).get(cls_name))
+            yoy, _ = _fmt_change(cur_v, asset_classes.get("old", {}).get(cls_name))
+            ac_rows.append([
+                cls_name,
+                _fmt_dollars(asset_classes.get("old", {}).get(cls_name)),
+                _fmt_dollars(asset_classes.get("prior", {}).get(cls_name)),
+                _fmt_dollars(cur_v),
+                f"{cur_v / cur_total:.2%}" if cur_v and cur_total else "N/A",
+                qoq,
+                yoy,
+            ])
+        md.append(_markdown_table(["Asset Class", old_label, prior_label, cur_label, "% of Portfolio", "QoQ", "YoY"], ac_rows))
+
+    hmda = export_data.get("hmda")
+    if hmda and hmda.get("found"):
+        md.extend(["", "## HMDA Mortgage Originations"])
+        hmda_rows = [
+            ["Year", hmda.get("year", "")],
+            ["LEI", hmda.get("lei", "")],
+            ["Originations", f"{hmda.get('total_count', 0):,}"],
+            ["Volume", _fmt_dollars(hmda.get("total_sum"))],
+        ]
+        md.append(_markdown_table(["Metric", "Value"], hmda_rows))
+
+    md.extend(["", "## AI Analysis", analysis.strip() or "No AI analysis was generated."])
+
+    sales_text = _plain_text_from_html(sales_questions_html)
+    if sales_text:
+        md.extend(["", "## Sales Conversation Guide", sales_text])
+
+    md.extend([
+        "",
+        "## Notes",
+        "- Growth figures are annualized quarter-over-quarter changes.",
+        "- Q1 YTD figures are annualized x4, Q2 x2, Q3 x1.33, and Q4 x1.",
+        "- This export is informational only and is not investment or regulatory advice.",
+    ])
+
+    csv_rows: list[dict[str, object]] = []
+
+    def add_csv(section: str, subsection: str, item: str, description: str = "",
+                benchmark: str = "", quarter: str = "", value: object = "",
+                formatted_value: str = "", rate: object = "", nco_rate: object = "",
+                qoq_change: str = "", yoy_change: str = "", notes: str = "") -> None:
+        csv_rows.append({
+            "section": section,
+            "subsection": subsection,
+            "item": item,
+            "description": description,
+            "benchmark": benchmark,
+            "quarter": quarter,
+            "value": value,
+            "formatted_value": formatted_value,
+            "rate": rate,
+            "nco_rate": nco_rate,
+            "qoq_change": qoq_change,
+            "yoy_change": yoy_change,
+            "notes": notes,
+        })
+
+    if cu_meta:
+        for field, value in profile_rows:
+            add_csv("profile", "", field, value=value, formatted_value=str(value))
+
+    for rk, info in RATIOS.items():
+        for r in ratios:
+            add_csv(
+                "ratios", "",
+                info["label"],
+                description=info["desc"],
+                benchmark=info["bm_label"],
+                quarter=r.get("quarter", ""),
+                value=_fmt_raw(r.get(rk)),
+                formatted_value=fv(rk, r.get(rk)),
+                notes=f"direction={info.get('direction', '')}",
+            )
+
+    def add_balance_rows(section: str, categories: list[tuple[str, str]], values_by_period: dict,
+                         formatter=_fmt_dollars) -> None:
+        period_map = [
+            ("old", old_label),
+            ("prior", prior_label),
+            ("current", cur_label),
+        ]
+        for key, label in categories:
+            cur_v = values_by_period.get("current", {}).get(key)
+            qoq, _ = _fmt_change(cur_v, values_by_period.get("prior", {}).get(key))
+            yoy, _ = _fmt_change(cur_v, values_by_period.get("old", {}).get(key))
+            for period_key, label_q in period_map:
+                add_csv(
+                    section, key, label,
+                    quarter=label_q,
+                    value=_fmt_raw(values_by_period.get(period_key, {}).get(key)),
+                    formatted_value=formatter(values_by_period.get(period_key, {}).get(key)),
+                    qoq_change=qoq if period_key == "current" else "",
+                    yoy_change=yoy if period_key == "current" else "",
+                )
+
+    if shares:
+        add_balance_rows("shares_deposits", SHARE_CATEGORIES, shares)
+    if investments:
+        add_balance_rows("investment_types", INVEST_TYPE_CATEGORIES, investments)
+        add_balance_rows("investment_maturity", INVEST_MATURITY_BUCKETS, investments)
+    if asset_classes:
+        add_balance_rows("asset_classes", [(name, name) for name, _ in ASSET_CLASSES], asset_classes)
+    if loans:
+        for key, label in LOAN_CATEGORIES:
+            cur_v = loans.get("current", {}).get(key)
+            qoq, _ = _fmt_change(cur_v, loans.get("prior", {}).get(key))
+            yoy, _ = _fmt_change(cur_v, loans.get("old", {}).get(key))
+            rate_key = LOAN_RATE_KEY.get(key)
+            rate = export_data.get("loan_rates", {}).get(rate_key) if rate_key else ""
+            loss = export_data.get("loan_losses", {}).get(key)
+            nco_rate = (loss / cur_v) if loss is not None and cur_v else ""
+            for period_key, label_q in [("old", old_label), ("prior", prior_label), ("current", cur_label)]:
+                add_csv(
+                    "loan_portfolio", key, label,
+                    quarter=label_q,
+                    value=_fmt_raw(loans.get(period_key, {}).get(key)),
+                    formatted_value=_fmt_dollars(loans.get(period_key, {}).get(key)),
+                    rate=_fmt_raw(rate) if period_key == "current" else "",
+                    nco_rate=_fmt_raw(nco_rate) if period_key == "current" else "",
+                    qoq_change=qoq if period_key == "current" else "",
+                    yoy_change=yoy if period_key == "current" else "",
+                )
+
+    if upstart_rec:
+        add_csv("upstart_recommendation", "", "overall", value=upstart_rec.get("overall", ""))
+        add_csv("upstart_recommendation", "", "confidence", value=upstart_rec.get("confidence", ""))
+        for i, product in enumerate(upstart_rec.get("products", []), 1):
+            add_csv(
+                "upstart_products", f"rank_{i}", product,
+                value=upstart_rec.get("product_scores", {}).get(product, ""),
+                notes=upstart_rec.get("product_reasoning", {}).get(product, ""),
+            )
+        for i, signal in enumerate(upstart_rec.get("signals", []), 1):
+            weight = upstart_rec.get("signal_weights", [""] * len(upstart_rec.get("signals", [])))
+            add_csv("upstart_signals", f"rank_{i}", signal, value=weight[i - 1] if i - 1 < len(weight) else "")
+        for i, concern in enumerate(upstart_rec.get("concerns", []), 1):
+            add_csv("upstart_concerns", f"item_{i}", concern)
+
+    if hmda and hmda.get("found"):
+        add_csv("hmda", "summary", "originations", quarter=str(hmda.get("year", "")),
+                value=hmda.get("total_count", ""), formatted_value=f"{hmda.get('total_count', 0):,}",
+                notes=f"LEI={hmda.get('lei', '')}")
+        add_csv("hmda", "summary", "volume", quarter=str(hmda.get("year", "")),
+                value=_fmt_raw(hmda.get("total_sum")), formatted_value=_fmt_dollars(hmda.get("total_sum")))
+        for agg in hmda.get("by_loan_type", []):
+            code = str(agg.get("loan_types", ""))
+            add_csv("hmda", "loan_type", HMDA_LOAN_TYPES.get(code, code),
+                    quarter=str(hmda.get("year", "")), value=agg.get("count", ""),
+                    formatted_value=str(agg.get("count", "")), notes=f"volume={agg.get('sum', '')}")
+        for agg in hmda.get("by_loan_purpose", []):
+            code = str(agg.get("loan_purposes", ""))
+            add_csv("hmda", "loan_purpose", HMDA_LOAN_PURPOSES.get(code, code),
+                    quarter=str(hmda.get("year", "")), value=agg.get("count", ""),
+                    formatted_value=str(agg.get("count", "")), notes=f"volume={agg.get('sum', '')}")
+
+    csv_buf = io.StringIO()
+    csv_columns = [
+        "section", "subsection", "item", "description", "benchmark", "quarter",
+        "value", "formatted_value", "rate", "nco_rate", "qoq_change", "yoy_change", "notes",
+    ]
+    writer = csv.DictWriter(csv_buf, fieldnames=csv_columns)
+    writer.writeheader()
+    writer.writerows(csv_rows)
+
+    structured_payload = {
+        "schema_version": "1.0",
+        "generated": generated,
+        "credit_union": _json_safe(cu_meta or {"cu_name": cu_name}),
+        "reporting_quarters": quarters,
+        "ratios": [
+            {
+                "key": rk,
+                "label": info["label"],
+                "description": info["desc"],
+                "benchmark": info.get("benchmark"),
+                "benchmark_label": info.get("bm_label"),
+                "direction": info.get("direction"),
+                "values": [
+                    {
+                        "quarter": r.get("quarter"),
+                        "raw_value": r.get(rk),
+                        "formatted_value": fv(rk, r.get(rk)),
+                    }
+                    for r in ratios
+                ],
+            }
+            for rk, info in RATIOS.items()
+        ],
+        "latest_quarter": _json_safe(latest),
+        "portfolio_sections": _json_safe(export_data),
+        "upstart_recommendation": _json_safe(upstart_rec or {}),
+        "ai_analysis_markdown": analysis.strip(),
+        "sales_conversation_guide_text": sales_text,
+        "notes": [
+            "Growth figures are annualized quarter-over-quarter changes.",
+            "Q1 YTD figures are annualized x4, Q2 x2, Q3 x1.33, and Q4 x1.",
+            "This export is informational only and is not investment or regulatory advice.",
+        ],
+    }
+
+    return {
+        "fileBase": file_base,
+        "generated": generated,
+        "markdown": "\n".join(md).strip() + "\n",
+        "csv": csv_buf.getvalue(),
+        "json": json.dumps(structured_payload, indent=2, ensure_ascii=False),
+    }
+
+
 def _md(text: str) -> str:
     """Minimal Markdown → HTML converter for the analysis panel."""
     # Headers
@@ -3261,6 +3767,7 @@ def build_dashboard(
     upstart_top_html: str = "",    # DREW3: recommendation banner (top)
     upstart_bottom_html: str = "", # DREW3: rationale card (bottom)
     sales_questions_html: str = "", # DREW3.2: conversation starter questions
+    export_artifacts: Optional[dict] = None,
 ) -> None:
     ratio_keys  = list(RATIOS.keys())
     n_ratios    = len(ratio_keys)
@@ -3436,6 +3943,29 @@ def build_dashboard(
     q_range       = f"{quarters[0]} – {quarters[-1]}"
     trend_info    = trend_badge(ratios)
     safe_name     = re.sub(r"[^\w\s-]", "", cu_name).strip().replace(" ", "_")
+    export_artifacts = export_artifacts or {
+        "fileBase": safe_name or "credit_union_dashboard",
+        "markdown": "",
+        "csv": "",
+        "json": "",
+    }
+    export_json = json.dumps(export_artifacts, ensure_ascii=False).replace("</", "<\\/")
+
+    export_toolbar = f"""
+  <div class="export-toolbar" aria-label="Dashboard export controls">
+    <div class="export-menu">
+      <button type="button" id="export-button" class="export-button"
+              aria-haspopup="true" aria-expanded="false"
+              onclick="toggleExportMenu(event)">Export</button>
+      <div id="export-options" class="export-options" role="menu" aria-label="Export formats">
+        <button type="button" role="menuitem" onclick="exportDashboard('pdf')">PDF</button>
+        <button type="button" role="menuitem" onclick="exportDashboard('html')">HTML</button>
+        <button type="button" role="menuitem" onclick="exportDashboard('md')">Markdown (.md)</button>
+        <button type="button" role="menuitem" onclick="exportDashboard('json')">JSON</button>
+        <button type="button" role="menuitem" onclick="exportDashboard('csv')">CSV</button>
+      </div>
+    </div>
+  </div>"""
 
     # ── Metadata bar ────────────────────────────────────────────────────────
     if cu_meta:
@@ -3539,6 +4069,38 @@ def build_dashboard(
 
     .wrapper {{ max-width: 1480px; margin: 0 auto; padding: 32px 26px; }}
 
+    .export-toolbar {{
+      position: sticky; top: 0; z-index: 10;
+      display: flex; align-items: center; justify-content: flex-end;
+      padding: 10px 26px; background: rgba(238,241,245,.96);
+      border-bottom: 1px solid #dfe5ec; backdrop-filter: blur(8px);
+    }}
+    .export-menu {{ position: relative; }}
+    .export-button {{
+      border: 1px solid {DARK}; border-radius: 6px; background: {DARK};
+      color: white; font: 700 .84rem Inter, 'Helvetica Neue', Arial, sans-serif;
+      padding: 8px 13px; cursor: pointer;
+    }}
+    .export-button::after {{
+      content: "▾"; display: inline-block; margin-left: 8px; font-size: .75rem;
+    }}
+    .export-button:hover, .export-button[aria-expanded="true"] {{ background: #1f2f3f; }}
+    .export-options {{
+      display: none; position: absolute; right: 0; top: calc(100% + 8px);
+      min-width: 168px; background: white; border: 1px solid #c9d3df;
+      border-radius: 8px; box-shadow: 0 12px 28px rgba(31,47,63,.18);
+      padding: 5px; z-index: 20;
+    }}
+    .export-options.open {{ display: block; }}
+    .export-options button {{
+      display: block; width: 100%; border: 0; background: transparent;
+      color: {DARK}; font: 600 .84rem Inter, 'Helvetica Neue', Arial, sans-serif;
+      text-align: left; padding: 8px 10px; border-radius: 5px; cursor: pointer;
+    }}
+    .export-options button:hover, .export-options button:focus {{
+      background: #eef3f8; outline: none;
+    }}
+
     .card {{
       background: white; border-radius: 12px; padding: 28px 32px;
       box-shadow: 0 2px 12px rgba(0,0,0,.06); margin-bottom: 26px;
@@ -3584,6 +4146,14 @@ def build_dashboard(
       font-size: .78rem; color: #95a5a6;
     }}
     footer a {{ color: #95a5a6; }}
+
+    @media print {{
+      body {{ background: white; }}
+      .export-toolbar {{ display: none !important; }}
+      .wrapper {{ max-width: none; padding: 18px; }}
+      .card {{ box-shadow: none; break-inside: avoid; page-break-inside: avoid; }}
+      .header {{ print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
+    }}
   </style>
 </head>
 <body>
@@ -3601,6 +4171,8 @@ def build_dashboard(
   </div>
   {meta_bar}
 </header>
+
+{export_toolbar}
 
 <div class="wrapper">
 
@@ -3690,6 +4262,75 @@ def build_dashboard(
   &nbsp;|&nbsp;
   For informational purposes only — not investment or regulatory advice.
 </footer>
+
+<script>
+  window.__DASHBOARD_EXPORTS__ = {export_json};
+
+  function downloadDashboardAsset(filename, mimeType, contents) {{
+    const blob = new Blob([contents], {{ type: mimeType }});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }}
+
+  function dashboardHtmlExport() {{
+    const clone = document.documentElement.cloneNode(true);
+    const toolbar = clone.querySelector('.export-toolbar');
+    if (toolbar) toolbar.remove();
+    return '<!DOCTYPE html>\\n' + clone.outerHTML;
+  }}
+
+  function closeExportMenu() {{
+    const menu = document.getElementById('export-options');
+    const button = document.getElementById('export-button');
+    if (menu) menu.classList.remove('open');
+    if (button) button.setAttribute('aria-expanded', 'false');
+  }}
+
+  function toggleExportMenu(event) {{
+    event.stopPropagation();
+    const menu = document.getElementById('export-options');
+    const button = document.getElementById('export-button');
+    const isOpen = menu.classList.toggle('open');
+    button.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+  }}
+
+  function exportDashboard(format) {{
+    closeExportMenu();
+    const data = window.__DASHBOARD_EXPORTS__ || {{}};
+    const base = data.fileBase || 'credit_union_dashboard';
+
+    if (format === 'pdf') {{
+      window.print();
+      return;
+    }}
+    if (format === 'html') {{
+      downloadDashboardAsset(base + '_dashboard.html', 'text/html;charset=utf-8', dashboardHtmlExport());
+      return;
+    }}
+    if (format === 'md') {{
+      downloadDashboardAsset(base + '_dashboard.md', 'text/markdown;charset=utf-8', data.markdown || '');
+      return;
+    }}
+    if (format === 'json') {{
+      downloadDashboardAsset(base + '_dashboard.json', 'application/json;charset=utf-8', data.json || '{{}}');
+      return;
+    }}
+    if (format === 'csv') {{
+      downloadDashboardAsset(base + '_dashboard.csv', 'text/csv;charset=utf-8', data.csv || '');
+    }}
+  }}
+
+  document.addEventListener('click', closeExportMenu);
+  document.addEventListener('keydown', function(event) {{
+    if (event.key === 'Escape') closeExportMenu();
+  }});
+</script>
 
 </body>
 </html>"""
@@ -3850,6 +4491,7 @@ def main() -> None:
     print("─" * 58)
 
     hmda_html = ""
+    hmda_data: dict = {}
     cu_state  = cu_info.get("state", "") if cu_info else ""
     print("  Looking up LEI in GLEIF registry…")
     lei = lookup_lei(name)
@@ -3877,6 +4519,7 @@ def main() -> None:
     loans_html       = ""
     investments_html = ""
     asset_class_html = ""
+    export_data: dict = {"hmda": hmda_data}
     if len(raw) >= 2:
         # Use the same 3 quarters as the key ratio summary (oldest → newest)
         cur_rec   = raw[-1]
@@ -3892,10 +4535,20 @@ def main() -> None:
         old_label   = ql(old_rec["_year"],   old_rec["_month"])
         prior_label = ql(prior_rec["_year"], prior_rec["_month"])
         cur_label   = ql(cur_rec["_year"],   cur_rec["_month"])
+        export_data["labels"] = {
+            "old": old_label,
+            "prior": prior_label,
+            "current": cur_label,
+        }
 
         cur_shares   = extract_shares(cur_rec)
         prior_shares = extract_shares(prior_rec)
         old_shares   = extract_shares(old_rec)
+        export_data["shares"] = {
+            "old": old_shares,
+            "prior": prior_shares,
+            "current": cur_shares,
+        }
 
         shares_html = build_shares_table(
             ya_label    = old_label,
@@ -3909,11 +4562,20 @@ def main() -> None:
         cur_loans   = extract_loans(cur_rec)
         prior_loans = extract_loans(prior_rec)
         old_loans   = extract_loans(old_rec)
+        export_data["loans"] = {
+            "old": old_loans,
+            "prior": prior_loans,
+            "current": cur_loans,
+        }
 
         cur_rates           = extract_loan_rates(cur_rec)
         cur_portfolio_yield = compute_portfolio_yield(cur_rec)
         cur_losses          = extract_loan_losses(cur_rec)
         cur_portfolio_nco   = compute_portfolio_nco(cur_rec)
+        export_data["loan_rates"] = cur_rates
+        export_data["loan_losses"] = cur_losses
+        export_data["portfolio_yield"] = cur_portfolio_yield
+        export_data["portfolio_nco"] = cur_portfolio_nco
 
         loans_html = build_loans_table(
             ya_label            = old_label,
@@ -3932,6 +4594,12 @@ def main() -> None:
         prior_inv  = extract_investments(prior_rec)
         old_inv    = extract_investments(old_rec)
         cur_inv_yield = compute_investment_yield(cur_rec)
+        export_data["investments"] = {
+            "old": old_inv,
+            "prior": prior_inv,
+            "current": cur_inv,
+        }
+        export_data["investment_yield"] = cur_inv_yield
 
         investments_html = build_investments_table(
             ya_label    = old_label,
@@ -3946,6 +4614,11 @@ def main() -> None:
         cur_ac   = extract_asset_classes(cur_loans)
         prior_ac = extract_asset_classes(prior_loans)
         old_ac   = extract_asset_classes(old_loans)
+        export_data["asset_classes"] = {
+            "old": old_ac,
+            "prior": prior_ac,
+            "current": cur_ac,
+        }
 
         asset_class_html = build_asset_class_section(
             ya_label    = old_label,
@@ -3958,13 +4631,23 @@ def main() -> None:
 
     safe_fn  = re.sub(r"[^\w\s-]", "", name).strip().replace(" ", "_")
     out_file = f"{safe_fn}_Drew3_dashboard.html"
+    export_artifacts = build_export_artifacts(
+        name,
+        ratio_rows,
+        analysis,
+        cu_info,
+        export_data,
+        upstart_rec,
+        sales_q_html,
+    )
     build_dashboard(name, ratio_rows, analysis, out_file, cu_meta=cu_info,
                     shares_html=shares_html, loans_html=loans_html,
                     investments_html=investments_html,
                     asset_class_html=asset_class_html, hmda_html=hmda_html,
                     upstart_top_html=upstart_top_html,       # DREW3
                     upstart_bottom_html=upstart_bot_html,    # DREW3
-                    sales_questions_html=sales_q_html)       # DREW3.2
+                    sales_questions_html=sales_q_html,       # DREW3.2
+                    export_artifacts=export_artifacts)
 
     abs_path = os.path.abspath(out_file)
     webbrowser.open(f"file://{abs_path}")

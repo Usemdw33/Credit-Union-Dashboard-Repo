@@ -5,6 +5,7 @@ This is a repo for the Credit Union dashboards that we are releasing.  Each one 
   2. Added a ranking order for recommendations and supporting factors by impact and applicability.
   3. Added the generation of leading questions for sales based on the various factors in the credit union's numbers.
   4. Pointing out the numbers and opportunities directly for Upstart loans was avoided to eliminate defensiveness. 
+  5. Dashboard pages include an export menu for PDF, HTML, Markdown, JSON, and CSV outputs. PDF/HTML preserve the visual report, Markdown is optimized for ChatGPT-style review, JSON exposes exact structured context for agents, and CSV supports spreadsheet work.
 
 ## Okta Authentication
 
